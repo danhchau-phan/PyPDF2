@@ -125,7 +125,8 @@ def readUntilRegex(stream, regex, ignore_eof=False):
     """
     name = b_('')
     while True:
-        tok = stream.read(16)
+        tok = stream.read(16) # reads the next 16 bytes
+        # print("tok ", tok,"\ntok decode: ", tok.decode('latin-1'))
         if not tok:
             # stream has truncated prematurely
             if ignore_eof == True:
@@ -134,6 +135,7 @@ def readUntilRegex(stream, regex, ignore_eof=False):
                 raise PdfStreamError("Stream has ended unexpectedly")
         m = regex.search(tok)
         if m is not None:
+            # print("m.start", m.start(), "\ntok m.start", tok[:m.start()])
             name += tok[:m.start()]
             stream.seek(m.start()-len(tok), 1)
             break

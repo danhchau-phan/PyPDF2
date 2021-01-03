@@ -1104,6 +1104,280 @@ class PdfFileWriter(object):
     """Read and write property accessing the :meth:`getPageMode()<PdfFileWriter.getPageMode>`
     and :meth:`setPageMode()<PdfFileWriter.setPageMode>` methods."""
 
+class PdfFileExtractor(object):
+    def __init__(self, stream : bytes, strict=True):
+        self.strict = strict
+        self.xrefIndex = 0
+        self.stream = stream
+
+    def readNextEndLine(self, stream):
+        debug = False
+        if debug: print(">>readNextEndLine")
+        line = b_("")
+        while True:
+            # Prevent infinite loops in malformed PDFs
+            if stream.tell() == 0:
+                raise utils.PdfReadError("Could not read malformed PDF file")
+            x = stream.read(1)
+            if debug: print(("  x:", x, "%x"%ord(x)))
+            if stream.tell() < 2:
+                raise utils.PdfReadError("EOL marker not found")
+            stream.seek(-2, 1)
+            if x == b_('\n') or x == b_('\r'): ## \n = LF; \r = CR
+                crlf = False
+                while x == b_('\n') or x == b_('\r'):
+                    if debug:
+                        if ord(x) == 0x0D: print("  x is CR 0D")
+                        elif ord(x) == 0x0A: print("  x is LF 0A")
+                    x = stream.read(1)
+                    if x == b_('\n') or x == b_('\r'): # account for CR+LF
+                        stream.seek(-1, 1)
+                        crlf = True
+                    if stream.tell() < 2:
+                        raise utils.PdfReadError("EOL marker not found")
+                    stream.seek(-2, 1)
+                stream.seek(2 if crlf else 1, 1) #if using CR+LF, go back 2 bytes, else 1
+                break
+            else:
+                if debug: print("  x is neither")
+                line = x + line
+                if debug: print(("  RNEL line:", line))
+        if debug: print("leaving RNEL")
+        return line
+
+    def read(self, stream):
+        debug = False
+        if debug: print(">>read", stream)
+        # start at the end:
+        stream.seek(-1, 2)
+        if not stream.tell():
+            raise utils.PdfReadError('Cannot read an empty file')
+        last1K = stream.tell() - 1024 + 1 # offset of last 1024 bytes of stream
+        line = b_('')
+        while line[:5] != b_("%%EOF"):
+            if stream.tell() < last1K:
+                raise utils.PdfReadError("EOF marker not found")
+            line = self.readNextEndLine(stream)
+            if debug: print("  line:",line)
+
+        # find startxref entry - the location of the xref table
+        line = self.readNextEndLine(stream)
+        try:
+            startxref = int(line)
+        except ValueError:
+            # 'startxref' may be on the same line as the location
+            if not line.startswith(b_("startxref")):
+                raise utils.PdfReadError("startxref not found")
+            startxref = int(line[9:].strip())
+            warnings.warn("startxref on same line as offset")
+        else:
+            line = self.readNextEndLine(stream)
+            if line[:9] != b_("startxref"):
+                raise utils.PdfReadError("startxref not found")
+
+        # read all cross reference tables and their trailers
+        self.xref = {}
+        self.xref_objStm = {}
+        self.trailer = DictionaryObject()
+        while True:
+            # load the xref table
+            stream.seek(startxref, 0)
+            x = stream.read(1)
+            if x == b_("x"):
+                # standard cross-reference table
+                ref = stream.read(4)
+                if ref[:3] != b_("ref"):
+                    raise utils.PdfReadError("xref table read error")
+                readNonWhitespace(stream)
+                stream.seek(-1, 1)
+                firsttime = True; # check if the first time looking at the xref table (i.e: if reading the first line of xref table)
+                while True:
+                    num = readObject(stream, self)
+                    if firsttime and num != 0: # first line of xref is formatted: num size. what does num represent by the way??
+                         self.xrefIndex = num
+                         if self.strict:
+                            warnings.warn("Xref table not zero-indexed. ID numbers for objects will be corrected.", utils.PdfReadWarning)
+                            #if table not zero indexed, could be due to error from when PDF was created
+                            #which will lead to mismatched indices later on, only warned and corrected if self.strict=True
+                    firsttime = False
+                    readNonWhitespace(stream)
+                    stream.seek(-1, 1)
+                    size = readObject(stream, self) # size = number of objects in xref
+                    readNonWhitespace(stream)
+                    stream.seek(-1, 1)
+                    cnt = 0
+                    while cnt < size:
+                        line = stream.read(20)
+
+                        # It's very clear in section 3.4.3 of the PDF spec
+                        # that all cross-reference table lines are a fixed
+                        # 20 bytes (as of PDF 1.7). However, some files have
+                        # 21-byte entries (or more) due to the use of \r\n
+                        # (CRLF) EOL's. Detect that case, and adjust the line
+                        # until it does not begin with a \r (CR) or \n (LF).
+                        while line[0] in b_("\x0D\x0A"):
+                            stream.seek(-20 + 1, 1)
+                            line = stream.read(20)
+
+                        # On the other hand, some malformed PDF files
+                        # use a single character EOL without a preceeding
+                        # space.  Detect that case, and seek the stream
+                        # back one character.  (0-9 means we've bled into
+                        # the next xref entry, t means we've bled into the
+                        # text "trailer"):
+                        if line[-1] in b_("0123456789t"): # beginning of next line
+                            stream.seek(-1, 1)
+
+                        offset, generation = line[:16].split(b_(" "))
+                        offset, generation = int(offset), int(generation)
+                        if generation not in self.xref:
+                            self.xref[generation] = {}
+                        if num in self.xref[generation]:
+                            # It really seems like we should allow the last
+                            # xref table in the file to override previous
+                            # ones. Since we read the file backwards, assume
+                            # any existing key is already set correctly.
+                            pass
+                        else:
+                            self.xref[generation][num] = offset
+                        cnt += 1
+                        num += 1
+                    readNonWhitespace(stream)
+                    stream.seek(-1, 1)
+                    trailertag = stream.read(7)
+                    if trailertag != b_("trailer"):
+                        # more xrefs!
+                        stream.seek(-7, 1)
+                    else:
+                        break
+                readNonWhitespace(stream)
+                stream.seek(-1, 1)
+                newTrailer = readObject(stream, self)
+                for key, value in list(newTrailer.items()):
+                    if key not in self.trailer:
+                        self.trailer[key] = value
+                if "/Prev" in newTrailer:
+                    startxref = newTrailer["/Prev"]
+                else:
+                    break
+            elif x.isdigit():
+                # PDF 1.5+ Cross-Reference Stream
+                stream.seek(-1, 1)
+                idnum, generation = self.readObjectHeader(stream)
+                xrefstream = readObject(stream, self)
+                assert xrefstream["/Type"] == "/XRef"
+                self.cacheIndirectObject(generation, idnum, xrefstream)
+                streamData = BytesIO(b_(xrefstream.getData()))
+                # Index pairs specify the subsections in the dictionary. If
+                # none create one subsection that spans everything.
+                idx_pairs = xrefstream.get("/Index", [0, xrefstream.get("/Size")])
+                if debug: print(("read idx_pairs=%s"%list(self._pairs(idx_pairs))))
+                entrySizes = xrefstream.get("/W")
+                assert len(entrySizes) >= 3
+                if self.strict and len(entrySizes) > 3:
+                    raise utils.PdfReadError("Too many entry sizes: %s" %entrySizes)
+
+                def getEntry(i):
+                    # Reads the correct number of bytes for each entry. See the
+                    # discussion of the W parameter in PDF spec table 17.
+                    if entrySizes[i] > 0:
+                        d = streamData.read(entrySizes[i])
+                        return convertToInt(d, entrySizes[i])
+
+                    # PDF Spec Table 17: A value of zero for an element in the
+                    # W array indicates...the default value shall be used
+                    if i == 0:  return 1 # First value defaults to 1
+                    else:       return 0
+
+                def used_before(num, generation):
+                    # We move backwards through the xrefs, don't replace any.
+                    return num in self.xref.get(generation, []) or \
+                            num in self.xref_objStm
+
+                # Iterate through each subsection
+                last_end = 0
+                for start, size in self._pairs(idx_pairs):
+                    # The subsections must increase
+                    assert start >= last_end
+                    last_end = start + size
+                    for num in range(start, start+size):
+                        # The first entry is the type
+                        xref_type = getEntry(0)
+                        # The rest of the elements depend on the xref_type
+                        if xref_type == 0:
+                            # linked list of free objects
+                            next_free_object = getEntry(1)
+                            next_generation = getEntry(2)
+                        elif xref_type == 1:
+                            # objects that are in use but are not compressed
+                            byte_offset = getEntry(1)
+                            generation = getEntry(2)
+                            if generation not in self.xref:
+                                self.xref[generation] = {}
+                            if not used_before(num, generation):
+                                self.xref[generation][num] = byte_offset
+                                if debug: print(("XREF Uncompressed: %s %s"%(
+                                                num, generation)))
+                        elif xref_type == 2:
+                            # compressed objects
+                            objstr_num = getEntry(1)
+                            obstr_idx = getEntry(2)
+                            generation = 0 # PDF spec table 18, generation is 0
+                            if not used_before(num, generation):
+                                if debug: print(("XREF Compressed: %s %s %s"%(
+                                        num, objstr_num, obstr_idx)))
+                                self.xref_objStm[num] = (objstr_num, obstr_idx)
+                        elif self.strict:
+                            raise utils.PdfReadError("Unknown xref type: %s"%
+                                                        xref_type)
+
+                trailerKeys = "/Root", "/Encrypt", "/Info", "/ID"
+                for key in trailerKeys:
+                    if key in xrefstream and key not in self.trailer:
+                        self.trailer[NameObject(key)] = xrefstream.raw_get(key)
+                if "/Prev" in xrefstream:
+                    startxref = xrefstream["/Prev"]
+                else:
+                    break
+            else:
+                # bad xref character at startxref.  Let's see if we can find
+                # the xref table nearby, as we've observed this error with an
+                # off-by-one before.
+                stream.seek(-11, 1)
+                tmp = stream.read(20)
+                xref_loc = tmp.find(b_("xref"))
+                if xref_loc != -1:
+                    startxref -= (10 - xref_loc)
+                    continue
+                # No explicit xref table, try finding a cross-reference stream.
+                stream.seek(startxref, 0)
+                found = False
+                for look in range(5):
+                    if stream.read(1).isdigit():
+                        # This is not a standard PDF, consider adding a warning
+                        startxref += look
+                        found = True
+                        break
+                if found:
+                    continue
+                # no xref table found at specified location
+                raise utils.PdfReadError("Could not find xref table at specified location")
+        if not zero-indexed, verify that the table is correct; change it if necessary
+        if self.xrefIndex and not self.strict:
+            loc = stream.tell()
+            for gen in self.xref:
+                if gen == 65535: continue
+                for id in self.xref[gen]:
+                    stream.seek(self.xref[gen][id], 0)
+                    try:
+                        pid, pgen = self.readObjectHeader(stream)
+                    except ValueError:
+                        break
+                    if pid == id - self.xrefIndex:
+                        self._zeroXref(gen)
+                        break
+                    #if not, then either it's just plain wrong, or the non-zero-index is actually correct
+            stream.seek(loc, 0) #return to where it was
 
 class PdfFileReader(object):
     """
@@ -1147,8 +1421,11 @@ class PdfFileReader(object):
             fileobj.close()
         self.read(stream)
         self.stream = stream
-
         self._override_encryption = False
+        print(self.trailer["/Root"].getObject()["/Pages"] \
+                .getObject()["/Kids"][0] \
+                .getObject()["/Contents"] \
+                .getObject())
 
     def getDocumentInfo(self):
         """
@@ -1236,6 +1513,12 @@ class PdfFileReader(object):
         """
         ## ensure that we're not trying to access an encrypted PDF
         #assert not self.trailer.has_key("/Encrypt")
+
+        # print(self.trailer["/Root"].getObject()["/Pages"] \
+        #         .getObject()["/Kids"][0] \
+        #         .getObject()["/Contents"] \
+        #         .getObject().getData()
+        #     )
         if self.flattenedPages == None:
             self._flatten()
         return self.flattenedPages[pageNumber]
@@ -1568,7 +1851,6 @@ class PdfFileReader(object):
             self.flattenedPages = []
             catalog = self.trailer["/Root"].getObject()
             pages = catalog["/Pages"].getObject()
-
         t = "/Pages"
         if "/Type" in pages:
             t = pages["/Type"]
@@ -1588,8 +1870,10 @@ class PdfFileReader(object):
                 # parent's value:
                 if attr not in pages:
                     pages[attr] = value
+            # print("contents:            ",pages["/Contents"].getObject().getData())
             pageObj = PageObject(self, indirectRef)
             pageObj.update(pages)
+            
             self.flattenedPages.append(pageObj)
 
     def _getObjectFromStream(self, indirectReference):
@@ -1792,10 +2076,10 @@ class PdfFileReader(object):
                     raise utils.PdfReadError("xref table read error")
                 readNonWhitespace(stream)
                 stream.seek(-1, 1)
-                firsttime = True; # check if the first time looking at the xref table
+                firsttime = True; # check if the first time looking at the xref table (i.e: if reading the first line of xref table)
                 while True:
                     num = readObject(stream, self)
-                    if firsttime and num != 0:
+                    if firsttime and num != 0: # first line of xref is formatted: num size. what does num represent by the way??
                          self.xrefIndex = num
                          if self.strict:
                             warnings.warn("Xref table not zero-indexed. ID numbers for objects will be corrected.", utils.PdfReadWarning)
@@ -1804,7 +2088,7 @@ class PdfFileReader(object):
                     firsttime = False
                     readNonWhitespace(stream)
                     stream.seek(-1, 1)
-                    size = readObject(stream, self)
+                    size = readObject(stream, self) # size = number of objects in xref
                     readNonWhitespace(stream)
                     stream.seek(-1, 1)
                     cnt = 0
@@ -1827,7 +2111,7 @@ class PdfFileReader(object):
                         # back one character.  (0-9 means we've bled into
                         # the next xref entry, t means we've bled into the
                         # text "trailer"):
-                        if line[-1] in b_("0123456789t"):
+                        if line[-1] in b_("0123456789t"): # beginning of next line
                             stream.seek(-1, 1)
 
                         offset, generation = line[:16].split(b_(" "))
@@ -1965,21 +2249,21 @@ class PdfFileReader(object):
                 # no xref table found at specified location
                 raise utils.PdfReadError("Could not find xref table at specified location")
         #if not zero-indexed, verify that the table is correct; change it if necessary
-        if self.xrefIndex and not self.strict:
-            loc = stream.tell()
-            for gen in self.xref:
-                if gen == 65535: continue
-                for id in self.xref[gen]:
-                    stream.seek(self.xref[gen][id], 0)
-                    try:
-                        pid, pgen = self.readObjectHeader(stream)
-                    except ValueError:
-                        break
-                    if pid == id - self.xrefIndex:
-                        self._zeroXref(gen)
-                        break
-                    #if not, then either it's just plain wrong, or the non-zero-index is actually correct
-            stream.seek(loc, 0) #return to where it was
+        # if self.xrefIndex and not self.strict:
+        #     loc = stream.tell()
+        #     for gen in self.xref:
+        #         if gen == 65535: continue
+        #         for id in self.xref[gen]:
+        #             stream.seek(self.xref[gen][id], 0)
+        #             try:
+        #                 pid, pgen = self.readObjectHeader(stream)
+        #             except ValueError:
+        #                 break
+        #             if pid == id - self.xrefIndex:
+        #                 self._zeroXref(gen)
+        #                 break
+        #             #if not, then either it's just plain wrong, or the non-zero-index is actually correct
+        #     stream.seek(loc, 0) #return to where it was
 
     def _zeroXref(self, generation):
         self.xref[generation] = dict( (k-self.xrefIndex, v) for (k, v) in list(self.xref[generation].items()) )
@@ -2690,9 +2974,12 @@ class PageObject(DictionaryObject):
     def extractRawText(self):
         text = u_("")
         content = self["/Contents"].getObject()
+        # print("-----this is raw stream------",content.getObject().getData())
         if not isinstance(content, ContentStream):
             content = ContentStream(content, self.pdf)
-        return content.operations
+        for operands, operator in content.operations:
+            text += str(operands) + operator.decode('latin-1') + "\n"
+        return text
 
     mediaBox = createRectangleAccessor("/MediaBox", ())
     """
@@ -2732,7 +3019,7 @@ class PageObject(DictionaryObject):
 
 
 class ContentStream(DecodedStreamObject):
-    def __init__(self, stream, pdf):
+    def __init__(self, stream, pdf): # stream here is the stream inside stream object, not the byte stream of the pdf
         self.pdf = pdf
         self.operations = []
         # stream may be a StreamObject or an ArrayObject containing
@@ -2752,13 +3039,14 @@ class ContentStream(DecodedStreamObject):
         stream.seek(0, 0)
         operands = []
         while True:
-            peek = readNonWhitespace(stream)
+            peek = readNonWhitespace(stream) # Finds and reads the next non-whitespace character (ignores whitespace)
             if peek == b_('') or ord_(peek) == 0:
                 break
-            stream.seek(-1, 1)
+            stream.seek(-1, 1) # go a character backward. what for??
             if peek.isalpha() or peek == b_("'") or peek == b_('"'):
-                operator = utils.readUntilRegex(stream,
-                        NameObject.delimiterPattern, True)
+                operator = utils.readUntilRegex(stream, 
+                        NameObject.delimiterPattern, True) # Reads until the regular expression pattern matched
+                # delimiterPattern = re.compile(b_(r"\s+|[\(\)<>\[\]{}/%]")) \s is space
                 if operator == b_("BI"):
                     # begin inline image - a completely different parsing
                     # mechanism is required, of course... thanks buddy...

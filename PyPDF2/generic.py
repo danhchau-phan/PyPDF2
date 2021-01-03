@@ -54,11 +54,11 @@ IndirectPattern = re.compile(b_(r"[+-]?(\d+)\s+(\d+)\s+R[^a-zA-Z]"))
 def readObject(stream, pdf):
     tok = stream.read(1)
     stream.seek(-1, 1) # reset to start
-    idx = ObjectPrefix.find(tok)
-    if idx == 0:
+    idx = ObjectPrefix.find(tok) # ObjectPrefix = b_('/<[tf(n%')
+    if idx == 0: # /
         # name object
         return NameObject.readFromStream(stream, pdf)
-    elif idx == 1:
+    elif idx == 1: # <
         # hexadecimal string OR dictionary
         peek = stream.read(2)
         stream.seek(-2, 1) # reset to start
@@ -66,19 +66,19 @@ def readObject(stream, pdf):
             return DictionaryObject.readFromStream(stream, pdf)
         else:
             return readHexStringFromStream(stream)
-    elif idx == 2:
+    elif idx == 2: # [
         # array object
         return ArrayObject.readFromStream(stream, pdf)
-    elif idx == 3 or idx == 4:
+    elif idx == 3 or idx == 4: # t or f
         # boolean object
         return BooleanObject.readFromStream(stream)
-    elif idx == 5:
+    elif idx == 5: # (
         # string object
         return readStringFromStream(stream)
-    elif idx == 6:
+    elif idx == 6: # n
         # null object
         return NullObject.readFromStream(stream)
-    elif idx == 7:
+    elif idx == 7: # %
         # comment
         while tok not in (b_('\r'), b_('\n')):
             tok = stream.read(1)
@@ -93,8 +93,8 @@ def readObject(stream, pdf):
         # number object OR indirect reference
         peek = stream.read(20)
         stream.seek(-len(peek), 1) # reset to start
-        if IndirectPattern.match(peek) != None:
-            return IndirectObject.readFromStream(stream, pdf)
+        if IndirectPattern.match(peek) != None: # re.compile(b_(r"[+-]?(\d+)\s+(\d+)\s+R[^a-zA-Z]"))
+            return IndirectObject.readFromStream(stream, pdf) 
         else:
             return NumberObject.readFromStream(stream)
 
@@ -560,7 +560,7 @@ class DictionaryObject(dict, PdfObject):
         data = {}
         while True:
             tok = readNonWhitespace(stream)
-            if tok == b_('\x00'):
+            if tok == b_('\x00'): # what is this line forrrr?
                 continue
             elif tok == b_('%'):
                 stream.seek(-1, 1)
@@ -571,7 +571,7 @@ class DictionaryObject(dict, PdfObject):
                 raise PdfStreamError("Stream has ended unexpectedly")
 
             if debug: print(("Tok:", tok))
-            if tok == b_(">"):
+            if tok == b_(">"): # end of dictionary
                 stream.read(1)
                 break
             stream.seek(-1, 1)
@@ -612,7 +612,7 @@ class DictionaryObject(dict, PdfObject):
                 stream.seek(t, 0)
             data["__streamdata__"] = stream.read(length)
             if debug: print("here")
-            #if debug: print(binascii.hexlify(data["__streamdata__"]))
+            # if debug: print(binascii.hexlify(data["__streamdata__"]))
             e = readNonWhitespace(stream)
             ndstream = stream.read(8)
             if (e + ndstream) != b_("endstream"):

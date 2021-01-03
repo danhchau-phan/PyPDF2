@@ -398,7 +398,10 @@ def decodeStreamData(stream):
     if data:
         for filterType in filters:
             if filterType == "/FlateDecode" or filterType == "/Fl":
+                # print(data,'\n',len(data))
                 data = FlateDecode.decode(data, stream.get("/DecodeParms"))
+                # print(data,'\n',len(data))
+                # print(data.decode('latin-1'))
             elif filterType == "/ASCIIHexDecode" or filterType == "/AHx":
                 data = ASCIIHexDecode.decode(data)
             elif filterType == "/LZWDecode" or filterType == "/LZW":
@@ -421,4 +424,5 @@ def decodeStreamData(stream):
             else:
                 # unsupported filter
                 raise NotImplementedError("unsupported filter %s" % filterType)
+    
     return data
