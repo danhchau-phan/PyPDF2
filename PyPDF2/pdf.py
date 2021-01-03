@@ -1379,6 +1379,9 @@ class PdfFileExtractor(object):
                     #if not, then either it's just plain wrong, or the non-zero-index is actually correct
             stream.seek(loc, 0) #return to where it was
 
+    def extract(self, operator : str):
+        arr = []
+        return arr
 class PdfFileReader(object):
     """
     Initializes a PdfFileReader object.  This operation can take some time, as
@@ -2969,16 +2972,6 @@ class PageObject(DictionaryObject):
                     if isinstance(i, TextStringObject):
                         text += i
                 text += "\n"
-        return text
-
-    def extractRawText(self):
-        text = u_("")
-        content = self["/Contents"].getObject()
-        # print("-----this is raw stream------",content.getObject().getData())
-        if not isinstance(content, ContentStream):
-            content = ContentStream(content, self.pdf)
-        for operands, operator in content.operations:
-            text += str(operands) + operator.decode('latin-1') + "\n"
         return text
 
     mediaBox = createRectangleAccessor("/MediaBox", ())
